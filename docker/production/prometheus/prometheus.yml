@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "user-service"
+    static_configs:
+      - targets: ["fin_user:8000"]
+
+  - job_name: "trade-service"
+    static_configs:
+      - targets: ["fin_trade:8000"]
+
+  - job_name: "restriction-service"
+    static_configs:
+      - targets: ["fin_restriction:8000"]
+
+  - job_name: "currency-service"
+    static_configs:
+      - targets: ["fin_currency:8000"]
+
+  - job_name: "account-service"
+    static_configs:
+      - targets: ["fin_account:8000"]
+
+  - job_name: "merchant-service"
+    static_configs:
+      - targets: ["fin_merchant:8000"]
+
+  - job_name: "pay-service"
+    static_configs:
+      - targets: ["fin_pay:8000"]
+
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["fin_pg_exporter:9187"]
+
+  - job_name: "rabbitmq"
+    static_configs:
+      - targets: ["fin_rabbitmq:15692"]

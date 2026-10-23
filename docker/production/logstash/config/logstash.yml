@@ -1,0 +1,8 @@
+api.http.host: 0.0.0.0
+node.name: logstash
+pipeline.workers: 2
+pipeline.batch.size: 250
+pipeline.batch.delay: 50
+queue.type: persisted
+api.enabled: false
+log.level: info

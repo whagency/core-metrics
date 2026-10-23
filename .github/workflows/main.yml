@@ -1,0 +1,271 @@
+name: Deploy metrics service
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build images
+        run: |
+          docker build -t fin-jaeger:latest -f ./docker/production/jaeger/Dockerfile .
+          docker build -t fin-elasticsearch:latest -f ./docker/production/elasticsearch/Dockerfile .
+          docker build -t fin-logstash:latest -f ./docker/production/logstash/Dockerfile .
+          docker build -t fin-kibana:latest -f ./docker/production/kibana/Dockerfile .
+          docker build -t fin-prometheus:latest -f ./docker/production/prometheus/Dockerfile .
+          docker build -t fin-grafana:latest -f ./docker/production/grafana/Dockerfile .
+          docker build -t fin-pg-exporter:latest -f ./docker/production/pg-exporter/Dockerfile .
+
+          docker save fin-jaeger:latest -o ./fin-jaeger.tar
+          docker save fin-elasticsearch:latest -o ./fin-elasticsearch.tar
+          docker save fin-logstash:latest -o ./fin-logstash.tar
+          docker save fin-kibana:latest -o ./fin-kibana.tar
+          docker save fin-prometheus:latest -o ./fin-prometheus.tar
+          docker save fin-grafana:latest -o ./fin-grafana.tar
+          docker save fin-pg-exporter:latest -o ./fin-pg-exporter.tar
+
+          chmod 644 ./fin-*.tar
+
+      - name: Copy image to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ vars.SERVER_HOST }}
+          username: ${{ vars.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+          source: "fin-*.tar"
+          target: "/var/www/deploy/"
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.SERVER_HOST }}
+          username: ${{ vars.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_PRIVATE_KEY }}
+          script: |
+            docker network create \
+              --driver bridge \
+              --subnet=172.28.0.0/16 \
+              --ip-range=172.28.0.128/25 \
+              fin_network || true
+            
+            # Jaeger
+            docker load -i /var/www/deploy/fin-jaeger.tar
+            docker stop fin_jaeger || true
+            docker rm fin_jaeger || true
+            docker run -d \
+              --user root \
+              --name fin_jaeger \
+              --restart always \
+              -e "SPAN_STORAGE_TYPE=badger" \
+              -e "BADGER_EPHEMERAL=false" \
+              -e "BADGER_DIRECTORY_VALUE=/badger/data" \
+              -e "BADGER_DIRECTORY_KEY=/badger/key" \
+              -e "MEMORY_MAX_TRACES=50000" \
+              -e "QUERY_BASE_PATH=/jaeger" \
+              -v fin_jaeger_data_prod:/badger \
+              --network fin_network \
+              --ip 172.28.0.14 \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              fin-jaeger:latest  
+            rm /var/www/deploy/fin-jaeger.tar
+            
+            # Elasticsearch
+            docker load -i /var/www/deploy/fin-elasticsearch.tar
+            docker stop fin_elasticsearch || true
+            docker rm fin_elasticsearch || true
+            docker run -d \
+              --name fin_elasticsearch \
+              --restart always \
+              --ulimit memlock=-1:-1 \
+              -e "node.name=elasticsearch" \
+              -e "discovery.type=single-node" \
+              -e "bootstrap.memory_lock=true" \
+              -e "ES_JAVA_OPTS=${{ vars.ELASTIC_JAVA_OPTS }}" \
+              -e "xpack.security.enabled=true" \
+              -e "ELASTIC_PASSWORD=${{ secrets.ELASTIC_PASSWORD }}" \
+              -v fin_elasticsearch_data_prod:/usr/share/elasticsearch/data \
+              --network fin_network \
+              --network-alias elasticsearch \
+              --ip 172.28.0.15 \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --memory="${{ vars.ELASTIC_MEMORY_LIMIT }}" \
+              --cpus="${{ vars.ELASTIC_CPU_LIMIT }}" \
+              fin-elasticsearch:latest  
+            rm /var/www/deploy/fin-elasticsearch.tar
+            
+            # Waiting for Elasticsearch start
+            until docker exec fin_elasticsearch curl -s -u elastic:${{ secrets.ELASTIC_PASSWORD }} \
+              "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=60s"; do
+              echo "Waiting for Elasticsearch cluster health ..."
+              sleep 5
+            done
+  
+            # Elasticsearch data
+            docker exec fin_elasticsearch curl -s -u elastic:${{ secrets.ELASTIC_PASSWORD }} \
+              -X POST "http://localhost:9200/_security/role/logstash_writer" \
+              -H "Content-Type: application/json" -d '{
+                "cluster": ["manage_index_templates", "monitor", "manage_ilm"],
+                "indices": [
+                  {
+                    "names": ["app-logs-*"],
+                    "privileges": ["write", "create", "create_index", "manage", "manage_ilm"]
+                  },
+                  {
+                      "names": ["logs-generic-default", "logstash-*", "ecs-logstash-*"],
+                      "privileges": ["write", "create", "create_index", "manage", "manage_ilm"]
+                  },
+                  {
+                    "names": ["logstash", "ecs-logstash"],
+                    "privileges": ["write", "manage"]
+                  },
+                  {
+                    "names": ["app-logs"],
+                    "privileges": ["manage", "write"]
+                  }
+                ]
+              }'
+
+            docker exec fin_elasticsearch curl -s -u elastic:${{ secrets.ELASTIC_PASSWORD }} \
+              -X POST "http://localhost:9200/_security/user/kibana_system/_password" \
+              -H "Content-Type: application/json" -d '{
+                "password": "${{ secrets.KIBANA_SYSTEM_PASSWORD }}"
+              }'
+              
+            docker exec fin_elasticsearch curl -s -u elastic:${{ secrets.ELASTIC_PASSWORD }} \
+              -X POST "http://localhost:9200/_security/user/logstash_internal" \
+              -H "Content-Type: application/json" -d '{
+                "password": "${{ secrets.LOGSTASH_INTERNAL_PASSWORD }}",
+                "roles": ["logstash_writer"]
+              }'
+            
+            docker exec fin_elasticsearch curl -s -u elastic:${{ secrets.ELASTIC_PASSWORD }} \
+              -X PUT "http://localhost:9200/_ilm/policy/app-logs-policy" \
+              -H "Content-Type: application/json" -d '{
+                "policy": {
+                  "phases": {
+                    "hot": { "actions": {} },
+                    "delete": {
+                      "min_age": "30d",
+                      "actions": { "delete": {} }
+                    }
+                  }
+                }
+              }'
+            
+            docker exec fin_elasticsearch curl -s -u elastic:${{ secrets.ELASTIC_PASSWORD }} \
+              -X PUT "http://localhost:9200/_index_template/app-logs-template" \
+              -H "Content-Type: application/json" -d '{
+                "index_patterns": ["app-logs-*"],
+                "template": {
+                  "settings": {
+                    "index.lifecycle.name": "app-logs-policy",
+                    "index.lifecycle.rollover_alias": "app-logs"
+                  }
+                }
+              }'
+
+            # Logstash
+            docker load -i /var/www/deploy/fin-logstash.tar
+            docker stop fin_logstash || true
+            docker rm fin_logstash || true
+            docker run -d \
+              --name fin_logstash \
+              --restart always \
+              -e "LS_JAVA_OPTS=${{ vars.LOGSTASH_JAVA_OPTS }}" \
+              -e "LOGSTASH_INTERNAL_PASSWORD=${{ secrets.LOGSTASH_INTERNAL_PASSWORD }}" \
+              --network fin_network \
+              --network-alias logstash \
+              --ip 172.28.0.16 \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              --memory="${{ vars.LOGSTASH_MEMORY_LIMIT }}" \
+              --cpus="${{ vars.LOGSTASH_CPU_LIMIT }}" \
+              fin-logstash:latest  
+            rm /var/www/deploy/fin-logstash.tar
+            
+            # Kibana
+            docker load -i /var/www/deploy/fin-kibana.tar
+            docker stop fin_kibana || true
+            docker rm fin_kibana || true
+            docker run -d \
+              --name fin_kibana \
+              --restart always \
+              -e "KIBANA_SYSTEM_PASSWORD=${{ secrets.KIBANA_SYSTEM_PASSWORD }}" \
+              -e "KIBANA_SECURITY_KEY=${{ vars.KIBANA_SECURITY_KEY }}" \
+              -e "KIBANA_SAVED_OBJECTS_KEY=${{ vars.KIBANA_SAVED_OBJECTS_KEY }}" \
+              -e "KIBANA_REPORTING_KEY=${{ vars.KIBANA_REPORTING_KEY }}" \
+              --network fin_network \
+              --ip 172.28.0.17 \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              fin-kibana:latest  
+            rm /var/www/deploy/fin-kibana.tar
+            
+            # Prometheus
+            docker load -i /var/www/deploy/fin-prometheus.tar
+            docker stop fin_prometheus || true
+            docker rm fin_prometheus || true
+            docker run -d \
+              --name fin_prometheus \
+              --restart always \
+              -v fin_prometheus_data_prod:/prometheus \
+              --network fin_network \
+              --ip 172.28.0.18 \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              fin-prometheus:latest  
+            rm /var/www/deploy/fin-prometheus.tar
+            
+            # Grafana
+            docker load -i /var/www/deploy/fin-grafana.tar
+            docker stop fin_grafana || true
+            docker rm fin_grafana || true
+            docker run -d \
+              --name fin_grafana \
+              --restart always \
+              -e "GF_SECURITY_ADMIN_USER=${{ vars.GF_SECURITY_ADMIN_USER }}" \
+              -e "GF_SECURITY_ADMIN_PASSWORD=${{ secrets.GF_SECURITY_ADMIN_PASSWORD }}" \
+              -e "GF_USERS_ALLOW_SIGN_UP=${{ vars.GF_USERS_ALLOW_SIGN_UP }}" \
+              -e "GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST=fin_prometheus:9090" \
+              -e "GF_AUTH_ANONYMOUS_ENABLED=false" \
+              -e "GF_USERS_ALLOW_ORG_CREATE=false" \
+              -v fin_grafana_data_prod:/var/lib/grafana \
+              --network fin_network \
+              --ip 172.28.0.19 \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              fin-grafana:latest
+            rm /var/www/deploy/fin-grafana.tar
+            
+            # Postgres Exporter
+            docker load -i /var/www/deploy/fin-pg-exporter.tar
+            docker stop fin_pg_exporter || true
+            docker rm fin_pg_exporter || true
+            docker run -d \
+              --name fin_pg_exporter \
+              --restart always \
+              -e "DATA_SOURCE_NAME=postgresql://${{ vars.DB_USER }}:${{ secrets.DB_PASSWORD }}@${{ vars.DB_HOST }}:${{ vars.DB_PORT }}/postgres?sslmode=disable&application_name=pg-exporter" \
+              -e "PG_EXPORTER_AUTO_DISCOVER_DATABASES=true" \
+              -e "PG_EXPORTER_EXCLUDE_DATABASES=template0,template1" \
+              --network fin_network \
+              --ip 172.28.0.20 \
+              --log-driver json-file \
+              --log-opt max-size=10m \
+              --log-opt max-file=3 \
+              fin-pg-exporter:latest
+            rm /var/www/deploy/fin-pg-exporter.tar
